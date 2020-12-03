@@ -369,6 +369,10 @@ class PersistEventsStore:
             txn, events_and_contexts=events_and_contexts, backfilled=backfilled
         )
 
+        # Update the auth chain index *before* filtering out existing outliers,
+        # as we need to handle out of band memberships needing to be indexed.
+        self._persist_event_auth_chain_txn(txn, [e for e, _ in events_and_contexts])
+
         # _update_outliers_txn filters out any events which have already been
         # persisted, and returns the filtered list.
         events_and_contexts = self._update_outliers_txn(
@@ -385,7 +389,26 @@ class PersistEventsStore:
         # Insert into event_to_state_groups.
         self._store_event_state_mappings_txn(txn, events_and_contexts)
 
-        self._persist_event_auth_chain_txn(txn, [e for e, _ in events_and_contexts])
+        # We want to store event_auth mappings for rejected events, as they're
+        # used in state res v2.
+        # This is only necessary if the rejected event appears in an accepted
+        # event's auth chain, but its easier for now just to store them (and
+        # it doesn't take much storage compared to storing the entire event
+        # anyway).
+        self.db_pool.simple_insert_many_txn(
+            txn,
+            table="event_auth",
+            values=[
+                {
+                    "event_id": event.event_id,
+                    "room_id": event.room_id,
+                    "auth_id": auth_id,
+                }
+                for event, _ in events_and_contexts
+                for auth_id in event.auth_event_ids()
+                if event.is_state()
+            ],
+        )
 
         # _store_rejected_events_txn filters out any events which were
         # rejected, and returns the filtered list.
@@ -435,10 +458,26 @@ class PersistEventsStore:
         state_events = [
             event
             for event in events
-            if event.is_state()
-            and room_to_index[event.room_id]
-            and not event.internal_metadata.is_out_of_band_membership()
+            if event.is_state() and room_to_index[event.room_id]
         ]
+        if state_events:
+            # Ignore any events we've already indexed.
+            rows = self.db_pool.simple_select_many_txn(
+                txn,
+                table="event_auth_chains",
+                column="event_id",
+                iterable=[event.event_id for event in state_events],
+                retcols=("event_id",),
+                keyvalues={},
+            )
+            already_indexed = {r["event_id"] for r in rows}
+            if already_indexed:
+                state_events = [
+                    event
+                    for event in state_events
+                    if event.event_id not in already_indexed
+                ]
+
         if state_events:
             chain_map = {}
             new_chains = {}
@@ -504,6 +543,18 @@ class PersistEventsStore:
                         )
                     else:
                         chain_map[auth_id] = (chain_id, sequence_number)
+
+            # For out of band memberships we may not have the auth events, in
+            # which case we ignore it for now and handle it when we come to join
+            # the room.
+            for event in state_events:
+                if not event.internal_metadata.is_out_of_band_membership():
+                    continue
+
+                for auth_id in event.auth_event_ids():
+                    if auth_id not in chain_map:
+                        events_to_calc_chain_id_for.discard(event.event_id)
+                        break
 
             # We now calculate the chain IDs/sequence numbers for the events. We
             # do this by looking at the chain ID and sequence number of any auth
