@@ -15,7 +15,7 @@
 import itertools
 import logging
 from queue import Empty, PriorityQueue
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Set, Tuple
 
 from synapse.api.errors import StoreError
 from synapse.events import EventBase
@@ -137,7 +137,9 @@ class EventFederationWorkerStore(EventsWorkerStore, SignatureWorkerStore, SQLBas
 
         return list(results)
 
-    async def get_auth_chain_difference(self, state_sets: List[Set[str]]) -> Set[str]:
+    async def get_auth_chain_difference(
+        self, room_id: str, state_sets: List[Set[str]]
+    ) -> Set[str]:
         """Given sets of state events figure out the auth chain difference (as
         per state res v2 algorithm).
 
@@ -149,11 +151,21 @@ class EventFederationWorkerStore(EventsWorkerStore, SignatureWorkerStore, SQLBas
             The set of the difference in auth chains.
         """
 
-        return await self.db_pool.runInteraction(
-            "get_auth_chain_difference",
-            self._get_auth_chain_difference_using_chains_txn,
-            state_sets,
-        )
+        # Check if we have indexed the room so we can use the chain cover
+        # algorithm.
+        room = await self.get_room(room_id)
+        if room["has_auth_chain_index"]:
+            return await self.db_pool.runInteraction(
+                "get_auth_chain_difference_chains",
+                self._get_auth_chain_difference_using_chains_txn,
+                state_sets,
+            )
+        else:
+            return await self.db_pool.runInteraction(
+                "get_auth_chain_difference",
+                self._get_auth_chain_difference_txn,
+                state_sets,
+            )
 
     def _get_auth_chain_difference_using_chains_txn(
         self, txn, state_sets: List[Set[str]]
